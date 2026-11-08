@@ -32,6 +32,20 @@
 // voice peaked at 1.3 kHz (99.9 %) on the SDR bench, so the 12.5 kHz value may still be low. 25 kHz not measured yet
 #define FM_TX_LIMIT_12K5	5u
 #define FM_TX_LIMIT_25K		0x0Fu
+#ifndef DM32_RF_NRF
+#define DM32_RF_NRF		0
+#endif
+#if DM32_RF_NRF
+// The newer RF section (board.mk DM32_RF=nrf): the DM-1801 Pro's FD6818 tables (rf_nrf_dm32.c), 0x40 on FM transmit
+// from the calibration page, and the TX aux word after each switch to TX (0x3B20, the stock NRFB firmware's value)
+extern const fd6818_variant_t fd6818_variant_dm1801pro;
+#define FD_VARIANT		(&fd6818_variant_dm1801pro)
+#define FD_REG40_BASE		0x3480u		// FM transmit: 0x40 = this + the calibration byte (hardware-dm1801pro.md 6.4)
+#define FD_REG_TX_AUX		0x50u
+#define FD_TX_AUX		0x3B20u
+#else
+#define FD_VARIANT		(&fd6818_variant_default)
+#endif
 #define FD_REG_NOISE		0x65u
 #define FD_REG_RSSI		0x67u
 
@@ -110,7 +124,7 @@ static void pa_key(void)
 
 static uint16_t fm_bw_reg(radio_bw_t bw)
 {
-	return bw == RADIO_BW_25K ? FD6818_BW_FM_25K : FD6818_BW_FM_12K5;
+	return bw == RADIO_BW_25K ? fd.variant->bw_fm_25k : fd.variant->bw_fm_12k5;
 }
 
 static hrc7000_tone_t c7_tone(uint8_t type)
@@ -168,7 +182,12 @@ static void dmr_rf_switch(bool tx)
 		lna(tx_hz, false);
 	}
 	// A split channel (repeater, duplex hotspot): the one synthesizer moves to the TX frequency for the burst and back
-	fd6818_dmr_burst_at(&fd, tx, FD6818_BW_DMR, synth_hz(tx ? tx_hz : rx_hz));
+	fd6818_dmr_burst_at(&fd, tx, fd.variant->bw_dmr, synth_hz(tx ? tx_hz : rx_hz));
+#if DM32_RF_NRF
+	if (tx) {
+		fd6818_write(&fd, FD_REG_TX_AUX, FD_TX_AUX);
+	}
+#endif
 	if (!tx) {
 		lna(rx_hz, true);
 	}
@@ -214,7 +233,7 @@ static void init(void)
 	hrc_pin_out(PIN_FD_CS, true);
 	hrc_pin_out(PIN_FD_CLK, false);
 	rfbus_3w_attach(&fd_bus, &fd_bus_pins);
-	fd6818_attach(&fd, &fd_bus.bus);
+	fd6818_attach_variant(&fd, &fd_bus.bus, FD_VARIANT);
 	fd6818_init(&fd);
 	fd6818_set_mode(&fd, FD6818_MODE_FM);
 	mode = RADIO_MODE_FM;
@@ -231,7 +250,9 @@ static void init(void)
 static void wake(void)
 {
 	if (asleep) {
+#if !DM32_RF_NRF
 		fd6818_rx_sleep(&fd, false, FD6818_MODE_FM);
+#endif
 		asleep = false;
 	}
 }
@@ -270,7 +291,7 @@ static bool rx_tune(uint32_t hz, radio_bw_t bw, const subtone_t *tone, bool am)
 	lna(hz, true);
 	fd6818_set_freq(&fd, synth_hz(hz));
 	if (mode == RADIO_MODE_DMR) {
-		fd6818_set_bandwidth(&fd, FD6818_BW_DMR);
+		fd6818_set_bandwidth(&fd, fd.variant->bw_dmr);
 		fd6818_set_state(&fd, FD6818_STATE_RX);
 	} else {
 #if CONFIG_AM_RX
@@ -341,13 +362,20 @@ static bool tx(uint32_t hz, radio_bw_t bw, uint8_t power, const subtone_t *tone)
 		// (dmr_rf_switch). In TX here, the hotspot, which keys to listen, heard nothing until its first burst
 		hrc_pin_write(PIN_MIC_PATH, false);
 		lna(have_rx ? rx_hz : hz, true);
-		fd6818_set_bandwidth(&fd, FD6818_BW_DMR);
+		fd6818_set_bandwidth(&fd, fd.variant->bw_dmr);
 		fd6818_set_state(&fd, FD6818_STATE_RX);
 		dmr_keyed = true;
 	} else {
 		lna(hz, false);
 		fd6818_set_rx_tone(&fd, FD6818_TONE_NONE, 0);	// 0x51's enable would add the FD6818's tone to the C7000's
 		fd6818_fm_tx_prepare(&fd);
+#if DM32_RF_NRF
+		// 0x40 on FM key-up: 0x3480 + the band's calibration byte, as on the DM-1801 Pro. Without calibration the
+		// power-on word stays; the next rx() puts it back (fd6818_set_freq)
+		if (bf_cal_valid()) {
+			fd6818_write(&fd, FD6818_REG_BAND_B, (uint16_t)(FD_REG40_BASE + bf_cal_tx_byte(hz, BF_ROW_REG40)));
+		}
+#endif
 		tx_wide = bw == RADIO_BW_25K;
 		hrc7000_set_subtone(&modem, true, c7_tone(tone != NULL ? tone->type : TONE_NONE),
 			tone != NULL ? tone->value : 0);	// before FM_PTT: the modem takes the DCS code then
@@ -355,6 +383,10 @@ static bool tx(uint32_t hz, radio_bw_t bw, uint8_t power, const subtone_t *tone)
 		hrc_pin_write(PIN_MIC_PATH, true);
 		fd6818_set_bandwidth(&fd, fm_bw_reg(bw));
 		fd6818_set_state(&fd, FD6818_STATE_TX);
+#if DM32_RF_NRF
+		fd6818_write(&fd, FD_REG_TX_AUX, FD_TX_AUX);
+		hal_delay_ms(1);
+#endif
 		pa_key();
 	}
 	transmitting = true;
@@ -572,7 +604,11 @@ static void rx_sleep(bool sleep)
 		return;
 	}
 	if (sleep) {
+#if DM32_RF_NRF
+		fd6818_set_state(&fd, FD6818_STATE_IDLE);	// the DM-1801 Pro's sleep: no low-power 0x37 word
+#else
 		fd6818_rx_sleep(&fd, true, FD6818_MODE_FM);
+#endif
 		lna(rx_hz, false);
 		asleep = true;
 	} else {
